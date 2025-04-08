@@ -4,104 +4,115 @@ import matter from 'gray-matter'
 import fg from 'fast-glob'
 import { fileURLToPath } from 'url'
 
-// ✅ CLI 參數解析
 const args = process.argv.slice(2)
 function getArgValue(flag, defaultValue) {
 	const index = args.indexOf(flag)
 	return index !== -1 && args[index + 1] ? args[index + 1] : defaultValue
 }
 
-// 📂 CLI 指定輸入輸出資料夾
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
 const INPUT_DIR = path.resolve(__dirname, getArgValue('--input', 'articles'))
 const OUTPUT_BASE = path.resolve(__dirname, getArgValue('--output', 'output'))
+const TASK_FILE = path.resolve(__dirname, 'tasks.json')
 
-// 🔁 frontmatter 轉換邏輯
 function transformFrontmatter(data) {
+	data.categories.length--
 	return {
 		title: data.title || '',
 		publishDate: data.date ? data.date.split('T')[0] : '',
-		description: '請在這裡輸入摘要內容',
-		tags: data.tags || [],
+		description: '',
+		tags: [...new Set([data.tags, data.categories].flat())] || [],
+		legacy: true,
 	}
 }
 
-// 📁 建立輸出資料夾名稱邏輯：使用 slug 或 fallback 為上層資料夾名
 function getOutputDir(slug, filePath) {
-	const fallback = path.basename(path.dirname(filePath)) // 使用上層資料夾名
-	const rawName = slug || fallback || ''
-	let safeName = slugify(rawName)
+	const dirName = (slug != 'index' && slug) || path.basename(path.dirname(filePath)) // 取得 .md 所在資料夾名稱
+	let safeName = slugify(dirName)
 
-	// 🚫 確保不會是空字串或 output 本身
+	// 🚫 如果 slugify 後仍為空或是 "output"，則 fallback 用隨機值
 	if (!safeName || safeName.toLowerCase() === 'output') {
-		const uniqueId = Math.random().toString(36).substring(2, 8) // 例如 "a1b2c3"
+		const uniqueId = Math.random().toString(36).substring(2, 8)
 		safeName = `untitled-${uniqueId}`
 	}
 
 	return path.join(OUTPUT_BASE, safeName)
 }
 
-// 轉換成安全資料夾名稱
 function slugify(text) {
 	return text
 		.toString()
-		.normalize('NFKD') // 避免中文字或重音符號
-		.replace(/[^\w\- ]+/g, '') // 移除特殊符號
+		.normalize('NFKD')
+		.replace(/[^\w\- ]+/g, '')
 		.trim()
-		.replace(/\s+/g, '-') // 空格轉破折號
+		.replace(/\s+/g, '-')
 		.toLowerCase()
 }
 
-// 📄 處理 Markdown
-async function processMarkdown(filePath) {
-	const content = await fs.readFile(filePath, 'utf8')
-	const parsed = matter(content)
+// 讀取任務檔案並執行
+async function runTasksFromFile() {
+	const taskJson = await fs.readFile(TASK_FILE, 'utf8')
+	const tasks = JSON.parse(taskJson)
 
+	for (const task of tasks) {
+		await processMarkdownAndAssets(task)
+	}
+
+	console.log('\n✅ 所有任務已完成')
+}
+
+// 執行 Markdown 處理與複製資源
+async function processMarkdownAndAssets(task) {
+	const content = await fs.readFile(task.filePath, 'utf8')
+	const parsed = matter(content)
 	const frontmatter = transformFrontmatter(parsed.data)
 	const newContent = matter.stringify(parsed.content, frontmatter, { lineWidth: -1 })
 
-	const outDir = getOutputDir(parsed.data.slug, filePath)
-	await fs.mkdir(outDir, { recursive: true })
-
-	const fileName = path.basename(filePath)
-	const outPath = path.join(outDir, fileName)
-
+	await fs.mkdir(task.outDir, { recursive: true })
+	const outPath = path.join(task.outDir, task.fileName)
 	await fs.writeFile(outPath, newContent, 'utf8')
-	console.log(`✅ 轉換：${filePath} → ${outPath}`)
+	console.log(`✅ 轉換：${task.filePath} → ${outPath}`)
 
-	return { outDir, srcDir: path.dirname(filePath), excludeFile: fileName }
+	const entries = await fs.readdir(task.srcDir, { withFileTypes: true })
+	for (const entry of entries) {
+		const srcPath = path.join(task.srcDir, entry.name)
+		const destPath = path.join(task.outDir, entry.name)
+		if (entry.isFile() && entry.name !== task.fileName && !entry.name.endsWith('.md')) {
+			await fs.copyFile(srcPath, destPath)
+			console.log(`📎 複製：${srcPath} → ${destPath}`)
+		}
+	}
 }
 
-// 📁 複製非 .md 檔案
-async function copySiblingAssets(srcDir, outDir, excludeFile) {
-	const entries = await fs.readdir(srcDir, { withFileTypes: true })
+// 產生 tasks.json
+async function generateTaskFile() {
+	const mdFiles = await fg(`${INPUT_DIR}/**/*.md`)
+	const filteredFiles = mdFiles.filter(filePath => path.basename(filePath) !== '_index.md')
 
-	await Promise.all(
-		entries.map(async entry => {
-			const srcPath = path.join(srcDir, entry.name)
-			const destPath = path.join(outDir, entry.name)
+	const tasks = await Promise.all(
+		filteredFiles.map(async filePath => {
+			const content = await fs.readFile(filePath, 'utf8')
+			const parsed = matter(content)
+			const outDir = getOutputDir(parsed.data.slug, filePath)
 
-			if (entry.isFile() && entry.name !== excludeFile && !entry.name.endsWith('.md')) {
-				await fs.copyFile(srcPath, destPath)
-				console.log(`📎 複製：${srcPath} → ${destPath}`)
+			return {
+				filePath,
+				fileName: path.basename(filePath),
+				srcDir: path.dirname(filePath),
+				outDir,
 			}
 		}),
 	)
+
+	await fs.writeFile(TASK_FILE, JSON.stringify(tasks, null, 2), 'utf8')
+	console.log(`📦 任務已產生，共 ${tasks.length} 筆，請確認 ${TASK_FILE} 後再執行：\n\n👉 node script.js --run\n`)
 }
 
-// 🚀 主程式（已支援跳過 _index.md）
-const main = async () => {
-	const mdFiles = await fg(`${INPUT_DIR}/**/*.md`)
-
-	// 🛑 過濾掉 _index.md
-	const filteredFiles = mdFiles.filter(filePath => path.basename(filePath) !== '_index.md')
-
-	const tasks = await Promise.all(filteredFiles.map(processMarkdown))
-
-	await Promise.all(tasks.map(({ srcDir, outDir, excludeFile }) => copySiblingAssets(srcDir, outDir, excludeFile)))
-
-	console.log('\n🎉 所有檔案處理完成！（_index.md 已跳過）')
+// 主程式
+const isRun = args.includes('--run')
+if (isRun) {
+	await runTasksFromFile()
+} else {
+	await generateTaskFile()
 }
-
-main()
